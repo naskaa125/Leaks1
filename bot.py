@@ -1,21 +1,31 @@
 import os
 import discord
-from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ext import commands
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Configuration des intents Discord
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+class LeakBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        # Synchronise les commandes Slash avec Discord au démarrage
+        await self.tree.sync()
+        print("Commandes Slash synchronisées avec succès !")
+
+bot = LeakBot()
 
 # Variables d'environnement (configurées sur Railway)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
-# Liste des catégories FiveVault à surveiller
+# Liste des catégories FiveVault disponibles
 CATEGORIES = {
     "Script": {"url": "https://fivevault.net/category/scripts", "emoji": "📜"},
     "MLO": {"url": "https://fivevault.net/category/mlo", "emoji": "🏰"},
@@ -23,114 +33,94 @@ CATEGORIES = {
     "EUP / Clothing": {"url": "https://fivevault.net/category/eup", "emoji": "👕"},
 }
 
-# Pour stocker l'historique des liens déjà postés et éviter les doublons
-liens_deja_postes = set()
-
 @bot.event
 async def on_ready():
     print(f"Bot connecté en tant que {bot.user.name}")
-    
-    # Message de confirmation au démarrage sur Discord
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel:
-        await channel.send("🚀 **Bot démarré !** Test de connexion et d'analyse en cours...")
-        
-    # Démarre la boucle de vérification (toutes les 20 minutes)
-    verifier_nouvelles_ressources.start()
 
-@tasks.loop(minutes=20)
-async def verifier_nouvelles_ressources():
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        print("Salon Discord introuvable ! Vérifie CHANNEL_ID.")
+# --- COMMANDE SLASH /leaks ---
+@bot.tree.command(name="leaks", description="Récupère et publie le dernier leak de FiveVault dans le salon")
+@app_commands.describe(categorie="Choisis la catégorie du leak à récupérer")
+@app_commands.choices(categorie=[
+    app_commands.Choice(name="Script", value="Script"),
+    app_commands.Choice(name="MLO", value="MLO"),
+    app_commands.Choice(name="Vehicles", value="Vehicles"),
+    app_commands.Choice(name="EUP / Clothing", value="EUP / Clothing")
+])
+async def leaks(interaction: discord.Interaction, categorie: str):
+    # Diffère la réponse pour éviter le timeout pendant le scraping du site
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    config = CATEGORIES.get(categorie)
+    if not config:
+        await interaction.followup.send("Catégorie invalide.", ephemeral=True)
         return
+
+    url_categorie = config["url"]
+    emoji_categorie = config["emoji"]
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # Date limite : il y a 7 jours par rapport à aujourd'hui
-    date_limite = datetime.now() - timedelta(days=7)
+    try:
+        response = requests.get(url_categorie, headers=headers, timeout=10)
+        if response.status_code != 200:
+            await interaction.followup.send("Erreur lors de l'accès au site FiveVault.", ephemeral=True)
+            return
 
-    for nom_categorie, config in CATEGORIES.items():
-        try:
-            url_categorie = config["url"]
-            emoji_categorie = config["emoji"]
-            print(f"🔍 Vérification de : {url_categorie}")
+        soup = BeautifulSoup(response.text, 'html.parser')
+        items = soup.select('.resource-card, .post-item, article, .card')
 
-            response = requests.get(url_categorie, headers=headers, timeout=10)
-            print(f"📡 Code HTTP pour {nom_categorie} : {response.status_code}")
+        if not items:
+            await interaction.followup.send(f"Aucune ressource trouvée pour la catégorie {categorie}.", ephemeral=True)
+            return
 
-            if response.status_code != 200:
-                continue
+        # On prend le tout dernier item de la page
+        item = items[0]
+        lien_element = item.select_one('a')
+        if not lien_element or 'href' not in lien_element.attrs:
+            await interaction.followup.send("Impossible de récupérer le lien de la ressource.", ephemeral=True)
+            return
 
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Recherche des éléments sur la page
-            items = soup.select('.resource-card, .post-item, article, .card') 
-            print(f"📦 Nombre d'éléments trouvés pour {nom_categorie} : {len(items)}")
+        lien_ressource = lien_element['href']
+        titre = item.select_one('.title, h2, h3').text.strip() if item.select_one('.title, h2, h3') else "Ressource FiveM"
+        desc_element = item.select_one('.description, .excerpt, p')
+        description = desc_element.text.strip() if desc_element else "Aucune description fournie."
 
-            for item in items:
-                lien_element = item.select_one('a')
-                if not lien_element or 'href' not in lien_element.attrs:
-                    continue
+        date_str = datetime.now().strftime("%d/%m/%Y")
 
-                lien_ressource = lien_element['href']
+        # 1. Traitement GoFile
+        lien_gofile = uploader_ou_convertir_gofile(lien_ressource)
 
-                # Si on a déjà posté cette ressource, on passe
-                if lien_ressource in liens_deja_postes:
-                    continue
+        # 2. Recherche YouTube
+        lien_youtube = chercher_youtube(f"FiveM {titre}")
 
-                titre = item.select_one('.title, h2, h3').text.strip() if item.select_one('.title, h2, h3') else "Ressource FiveM"
-                desc_element = item.select_one('.description, .excerpt, p')
-                description = desc_element.text.strip() if desc_element else "Aucune description fournie."
+        # 3. Format du message Discord identique à ton image
+        message_content = (
+            f"{emoji_categorie} **Nouvel ajout — {categorie}**\n"
+            f"Une ressource a été ajoutée dans les leaks.\n\n"
+            f"📄 **Contenu**\n"
+            f"# {categorie}\n\n"
+            f"• 🎬 **Preview** : {lien_youtube}\n"
+            f"• 💻 **Download** : {lien_gofile}\n\n"
+            f"**Description**\n"
+            f"{description[:350]}...\n\n"
+            f"📁 **Type**\n"
+            f"{emoji_categorie} **{categorie}**\n"
+            f"📅 **Date**\n"
+            f"{date_str}\n"
+            f"📍 **Source**\n"
+            f"# inconnu"
+        )
 
-                # Récupération de la date
-                date_element = item.select_one('.date, time')
-                resource_date = datetime.now()
-                
-                if date_element:
-                    date_str_site = date_element.text.strip()
-                    try:
-                        resource_date = datetime.strptime(date_str_site, "%d/%m/%Y")
-                    except:
-                        pass
+        # Envoie le message publiquement dans le salon où la commande a été tapée
+        await interaction.channel.send(message_content)
+        
+        # Confirme discrètement à toi que c'est posté
+        await interaction.followup.send("✅ Leak publié avec succès dans le salon !", ephemeral=True)
 
-                # Filtre des 7 derniers jours
-                if resource_date >= date_limite:
-                    liens_deja_postes.add(lien_ressource)
-
-                    # 1. Traitement GoFile
-                    lien_gofile = uploader_ou_convertir_gofile(lien_ressource)
-
-                    # 2. Recherche YouTube
-                    lien_youtube = chercher_youtube(f"FiveM {titre}")
-
-                    date_formatee = resource_date.strftime("%d/%m/%Y")
-
-                    # 3. Format du message Discord
-                    message_content = (
-                        f"{emoji_categorie} **Nouvel ajout — {nom_categorie}**\n"
-                        f"Une ressource a été ajoutée dans les leaks.\n\n"
-                        f"📄 **Contenu**\n"
-                        f"# {nom_categorie}\n\n"
-                        f"• 🎬 **Preview** : {lien_youtube}\n"
-                        f"• 💻 **Download** : {lien_gofile}\n\n"
-                        f"**Description**\n"
-                        f"{description[:350]}...\n\n"
-                        f"📁 **Type**\n"
-                        f"{emoji_categorie} **{nom_categorie}**\n"
-                        f"📅 **Date**\n"
-                        f"{date_formatee}\n"
-                        f"📍 **Source**\n"
-                        f"# inconnu"
-                    )
-
-                    await channel.send(message_content)
-                    print(f"✅ Ressource postée avec succès : {titre}")
-
-        except Exception as e:
-            print(f"❌ Erreur lors de la vérification de {nom_categorie} : {e}")
+    except Exception as e:
+        await interaction.followup.send(f"Une erreur est survenue : {e}", ephemeral=True)
 
 def uploader_ou_convertir_gofile(url_ressource):
     """Logique d'upload GoFile"""
