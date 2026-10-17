@@ -33,7 +33,7 @@ async def on_ready():
     # Message de confirmation au démarrage sur Discord
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
-        await channel.send("🚀 **Bot démarré !** Analyse des ressources des 7 derniers jours en cours...")
+        await channel.send("🚀 **Bot démarré !** Test de connexion et d'analyse en cours...")
         
     # Démarre la boucle de vérification (toutes les 20 minutes)
     verifier_nouvelles_ressources.start()
@@ -42,7 +42,7 @@ async def on_ready():
 async def verifier_nouvelles_ressources():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
-        print("Salon Discord introuvable !")
+        print("Salon Discord introuvable ! Vérifie CHANNEL_ID.")
         return
 
     headers = {
@@ -56,16 +56,20 @@ async def verifier_nouvelles_ressources():
         try:
             url_categorie = config["url"]
             emoji_categorie = config["emoji"]
+            print(f"🔍 Vérification de : {url_categorie}")
 
             response = requests.get(url_categorie, headers=headers, timeout=10)
+            print(f"📡 Code HTTP pour {nom_categorie} : {response.status_code}")
+
             if response.status_code != 200:
                 continue
 
             soup = BeautifulSoup(response.text, 'html.parser')
-
-            # On récupère tous les articles/cartes de la page (pas seulement le premier)
-            items = soup.select('.resource-card, .post-item, article') 
             
+            # Recherche des éléments sur la page
+            items = soup.select('.resource-card, .post-item, article, .card') 
+            print(f"📦 Nombre d'éléments trouvés pour {nom_categorie} : {len(items)}")
+
             for item in items:
                 lien_element = item.select_one('a')
                 if not lien_element or 'href' not in lien_element.attrs:
@@ -81,22 +85,19 @@ async def verifier_nouvelles_ressources():
                 desc_element = item.select_one('.description, .excerpt, p')
                 description = desc_element.text.strip() if desc_element else "Aucune description fournie."
 
-                # --- Tentative de récupération et de vérification de la date ---
-                # (Adapte le sélecteur .date selon la classe HTML exacte de la date sur FiveVault)
+                # Récupération de la date
                 date_element = item.select_one('.date, time')
-                resource_date = datetime.now() # Par défaut, date du jour si non trouvée
+                resource_date = datetime.now()
                 
                 if date_element:
                     date_str_site = date_element.text.strip()
                     try:
-                        # Essaie de parser le format de date du site (ex: JJ/MM/AAAA)
                         resource_date = datetime.strptime(date_str_site, "%d/%m/%Y")
                     except:
                         pass
 
-                # FILTRE : On ne prend que ce qui date de moins d'une semaine (ou égal)
+                # Filtre des 7 derniers jours
                 if resource_date >= date_limite:
-                    # On marque le lien comme posté pour éviter les doublons futurs
                     liens_deja_postes.add(lien_ressource)
 
                     # 1. Traitement GoFile
@@ -126,9 +127,10 @@ async def verifier_nouvelles_ressources():
                     )
 
                     await channel.send(message_content)
+                    print(f"✅ Ressource postée avec succès : {titre}")
 
         except Exception as e:
-            print(f"Erreur lors de la vérification de {nom_categorie} : {e}")
+            print(f"❌ Erreur lors de la vérification de {nom_categorie} : {e}")
 
 def uploader_ou_convertir_gofile(url_ressource):
     """Logique d'upload GoFile"""
